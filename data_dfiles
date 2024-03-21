@@ -1,0 +1,171 @@
+mkdir ref_genome
+cd ref_genome
+# get ref genome
+wget https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr6.fa.gz
+gunzip chr6.fa.gz
+cd ../
+
+
+# download SRA TOOL KIT and configure it
+wget https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/current/sratoolkit.current-ubuntu64.tar.gz
+tar -xzvf sratoolkit.current-ubuntu64.tar.gz
+mv sratoolkit.3.1.0-ubuntu64 sra_toolkit
+cd sra_toolkit/bin
+./vdb-config -i #set permission and default folders, go to TOOLS > set to current directory
+cd ../../
+
+
+# Download raw data
+# using the three samples from bioproject PRJEB62494
+# LINK: https://www.ncbi.nlm.nih.gov/bioproject/?term=PRJEB62494
+mkdir raw_data
+cd raw_data
+../sra_toolkit/bin/fastq-dump --split-files --gzip  ERR11468775 -X 5000
+
+## to do
+##download the raw data for the accessions ERR11468775, ERR11468776 and ERR11468777 each with 500000 reads (hint: use -X)
+## Use a new directory (raw_data_mapping) to store the above files (Important!!)
+## convert into paired end FASTQ files
+
+
+
+## day 5 - QC
+#### PLEASE NOTE..for simple linux operations (changing directory, etc) the commands
+#### are not provided. please try to use them from previous sessions
+
+
+#### MIND THE PATH!!!!
+
+## navigate to the folder with raw data
+
+#### checking read quality
+## using FASTQC
+sudo apt-get -y install fastqc ##may give errors while installation
+fastqc ERR11468775_* 
+
+## view QC results
+
+# run fastp 
+## results for full SRA download
+wget http://opengene.org/fastp/fastp
+chmod a+x fastp
+./fastp -i ERR11468775_1.fastq.gz -o ERR11468775_trimmed_1.fastq.gz -I ERR11468775_2.fastq.gz -O ERR11468775_trimmed_2.fastq.gz --detect_adapter_for_pe -f 10 -g -l 50 -c -h ERR11468775_fastp.html -w 10
+
+## install BWA
+# navigate to <name_ngs_internship folder>
+git clone https://github.com/lh3/bwa.git
+cd bwa; make
+
+# index ref genome with bwa
+# reference genome downloaded in session 4
+bwa index -a bwtsw -p chr6_ref chr6.fa
+bwa mem ../ref_genome/chr6_ref ../raw_data/ERR11468775_trimmed_1.fastq.gz ../raw_data/ERR11468775_trimmed_2.fastq.gz -t 10 -o sample1.sam
+
+
+#Download this data file (large data files, 11GB)
+wget https://storage.googleapis.com/genomics-public-data/resources/broad/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf
+
+wget https://storage.googleapis.com/genomics-public-data/resources/broad/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf.idx
+
+
+
+## preparatory steps
+mkdir day6_internship
+cd day6_internship
+# copy the sample1.sam file and chr6.fasta file into the present directory
+
+### data conversion
+## convert sam to bam format
+# install samtools
+sudo apt-get -y install samtools
+samtools view -bo sample1.bam sample1.sam
+
+samtools view -h yourfile.bam
+
+## using GATK
+# install GATK latest docker image
+# to get known variants file 
+wget https://storage.googleapis.com/genomics-public-data/resources/broad/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf
+wget https://storage.googleapis.com/genomics-public-data/resources/broad/hg38/v0/Homo_sapiens_assembly38.dbsnp138.vcf.idx
+
+## run docker in interactive mode
+docker run -it -v $PWD:/data broadinstitute/gatk:latest
+cd /data/
+
+##### data cleaning using GATK ####
+## adding read group info
+gatk AddOrReplaceReadGroups -I sample1.bam -O sample1_withRG.bam -ID 1 -LB lib1 -PL ILLUMINA -PU unit1 -SM sample1
+
+# sorting reads
+gatk SortSam -I sample1_withRG.bam -O sorted_sample1.bam -SO coordinate
+
+# overview of the mapping results
+samtools flagstat sorted_sample1.bam
+
+# marking duplicates
+gatk MarkDuplicates -I sorted_sample1.bam -O markedDups.bam -M metrics_duplicates
+
+
+
+
+#BQSR
+# creting reference genome files
+gatk CreateSequenceDictionary -R chr6.fa
+samtools faidx chr6.fa
+
+## running BQSR
+gatk BaseRecalibrator -I markedDups.bam -R chr6.fasta --known-sites Homo_sapiens_assembly38.dbsnp138.vcf -O sample1_recal_data.table
+
+## link to interpret the table
+https://gatk.broadinstitute.org/hc/en-us/articles/360035890531-Base-Quality-Score-Recalibration-BQSR
+
+
+
+
+## apply BQSR to bam file
+gatk ApplyBQSR -R ../ref_genome/chr6.fa -I sample1_markedDups.bam --bqsr-recal-file ../sample1_recal_data.table -O sample1_recal.bam
+samtools index /data/mapping/sample1_recal.bam
+
+
+### calling somatic variants using GATK
+# running tumor only pipeline
+gatk Mutect2 -I sample1_recal.bam -R ../ref_genome/chr6.fa -O sample1.vcf.gz
+
+## filtering variants
+gatk FilterMutectCalls -R ../ref_genome/chr6.fa -V sample1.vcf.gz -O filtered_sample1.vcf.gz
+
+## getting indels
+bcftools view --types indels sample1.vcf.gz >> sample1_indels.vcf
+
+## getting snps
+bcftools view --types snps sample1.vcf.gz >> sample1_indels.vcf
+
+# filtering VCF file
+bcftools filter -i '%QUAL>50' sample1.vcf.gz
+
+## germline variant calling
+# not an ideal sample
+## demonstrating with data as sample1: father; sample2: mother; sample3: child
+gatk HaplotypeCaller -R chr6.fa -I sample1_recal.bam -O sample1_germline.g.vcf.gz -ERC GVCF
+gatk HaplotypeCaller -R chr6.fa -I sample2_recal.bam -O sample2_germline.g.vcf.gz -ERC GVCF
+gatk HaplotypeCaller -R chr6.fa -I sample3_recal.bam -O sample3_germline.g.vcf.gz -ERC GVCF
+
+# importing vcf to genomicDB
+gatk GenomicsDBImport -V sample1_germline.g.vcf.gz -V sample2_germline.g.vcf.gz -V sample3_germline.g.vcf.gz --genomicsdb-workspace-path test_db --intervals chr6
+
+# genotyping
+gatk GenotypeGVCFs -R chr6.fa -V gendb://test_db -O try_new.vcf.gz 
+
+#VQSR can be done..but resource intensive; hence skipping
+
+## annotation of variants
+
+## Use VEP of ENSEMBL
+## use for GRCH38 version of human genome only
+https://grch37.ensembl.org/Multi/Tools/VEP
+## click on <main site>
+##for participants from Asia, go to this link
+https://asia.ensembl.org/Homo_sapiens/Tools/VEP/Ticket
+
+
+
